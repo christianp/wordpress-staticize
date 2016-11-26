@@ -16,8 +16,11 @@ namespace staticize;
 
 defined( 'ABSPATH' ) or die( 'No script kiddies please!' );
 
-define('POSTS_DIR','/src/content/posts');
-define('CONTENT_FILENAME','.md');
+define('POST_DIRS',[
+    'post' => '/src/content/posts',
+    'page' => '/src/content'
+]);
+define('CONTENT_FILENAME','.html');
 
 function get_relative_permalink( $url ) {
     return str_replace( home_url(), "", $url );
@@ -27,11 +30,13 @@ class Staticize {
 
     protected static $instance = NULL;
 
-    protected $output_dir = '';
+    public $output_dir = '';
     protected $static_home_url = '';
     protected $static_uploads_root = '';
 
     protected $last_build_time = '';
+
+    public $category_dict = array();
 
     public static function get_instance() {
         NULL == self::$instance and self::$instance = new self;
@@ -51,6 +56,7 @@ class Staticize {
         $this->static_home_url = $settings['static_home_url'];
         $this->static_uploads_root = $this->static_home_url . '/uploads';
         $this->last_build_time = $this->get_option('last_build');
+        $this->make_categories_dict();
 
         if(is_admin()) {
             add_action('admin_menu', function() {
@@ -86,12 +92,14 @@ class Staticize {
         }
 
         add_action('post_updated',function($post_id,$post_after,$post_before) {
-            $this->render_post($post_id);
+            $post = new StaticizePost($this,$post_id,get_post($post_id));
+            $post->render();
         });
-        add_action('profile_update',array(&$this,'make_authors_dict'));
+        add_action('profile_update',array(&$this,'write_authors_dict'));
 
-        add_action('trashed_post',function($postid) {
-            $this->delete_post($postid);
+        add_action('trash_post',function($postid) {
+            $post = new StaticizePost($this,$postid);
+            $post->delete_post();
         });
     }
 
@@ -120,16 +128,15 @@ class Staticize {
         <p>Last build: <?php echo $this->last_build_time; ?></p>
 
         <form method="POST">
-        <input type="hidden" name="rebuild" value="true">
-        <label>Force rebuild: <input type="checkbox" name="force_rebuild" checked="true"></label>
-        <button>Build</button>
+            <input type="hidden" name="rebuild" value="true">
+            <button>Build</button>
         </form>
         <?php
 
         if($_POST['rebuild']) {
-            $force_rebuild = $_POST['force_rebuild'];
-            $this->render_all_posts($force_rebuild);
-            $this->make_authors_dict();
+            $this->write_categories_dict();
+            $this->render_all(true);
+            $this->write_authors_dict();
         }
     }
 
@@ -155,9 +162,30 @@ class Staticize {
         <?php
     }
 
-    public function render_all_posts($force_rebuild=false) {
+    public function render_all($force_rebuild=false) {
         $last_build_time = get_option('staticize_last_build');
 
+        $posts = new \WP_Query(['orderby' => 'modified','nopaging' => true, 'post_type' => 'page']);
+
+        ?>
+            <h2>Rebuilding pages</h2>
+            <ul>
+        <?php
+
+        $this->built = 0;
+
+        while($posts->have_posts()) {
+            $posts->the_post();
+            $modified_date = get_the_modified_date('U');
+            if($force_rebuild || $modified_date > $this->last_build_time) {
+                $post = new StaticizePost($this,$GLOBALS['post']->ID);
+                $post->render();
+                $this->built += 1;
+            }
+        }
+        ?></ul><?php
+
+        echo "<p>$this->built pages built.</p>";
         $posts = new \WP_Query('orderby=modified&nopaging=true');
 
         ?>
@@ -171,7 +199,9 @@ class Staticize {
             $posts->the_post();
             $modified_date = get_the_modified_date('U');
             if($force_rebuild || $modified_date > $this->last_build_time) {
-                $this->render_post();
+                $post = new StaticizePost($this,$GLOBALS['post']->ID);
+                $post->render();
+                $this->built += 1;
             }
         }
         ?></ul><?php
@@ -182,80 +212,43 @@ class Staticize {
         $this->set_option('last_build',$this->last_build_time);
     }
 
-    public function render_post($post_obj=NULL) {
-        $GLOBALS['more'] = true;
-        if(!empty($post_obj)) {
-            $GLOBALS['post'] = $post_obj;
-            setup_postdata($post_obj);
+    protected function make_categories_dict() {
+        $categories = get_categories();
+        $category_dict = array();
+        $categories_by_id = [];
+        foreach($categories as $category) {
+            $category_dict[$category->slug] = [
+                'name' => $category->name,
+                'slug' => $category->slug,
+                'id' => $category->term_id,
+                'description' => $category->description,
+                'parent_id' => $category->parent,
+                'children' => array()
+            ];
+            $categories_by_id[$category->term_id] = $category->slug;
         }
-        $post = $post or $post_obj;
-
-        $title = get_the_title();
-        echo "<li>$title</li>";
-
-        $slug = get_post_field('post_name');
-        $publish_date = get_the_date('Y-m-d');
-
-        //$permalink = get_relative_permalink(get_permalink());
-        $destination = $this->output_dir . POSTS_DIR;
-        if(!file_exists($destination)) {
-            mkdir($destination,0700,true);
-        }
-
-        $tags = array();
-        $posttags = get_the_tags();
-        if($posttags) {
-            foreach($posttags as $tag) {
-                $tags[] = '"'.$tag->name.'"';
-            }
-        }
-        $categories = array();
-        $postcategories = get_the_category();
-        if($postcategories) {
-            foreach($postcategories as $category) {
-                $categories[] = '"'.$category->name.'"';
+        foreach($category_dict as $slug => $category) {
+            if($category['parent_id']) {
+                $p = $category;
+                while($p['parent_id']) {
+                    $parent = $category_dict[$categories_by_id[$p['parent_id']]];
+                    $parent['children'][] = $category['slug'];
+                    $category_dict[$parent['slug']] = $parent;
+                    $p = $parent;
+                }
+                $category['parent'] = $category_dict[$categories_by_id[$category['parent_id']]]['slug'];
+                $category_dict[$category['slug']] = $category;
             }
         }
 
+        $this->category_dict = $category_dict;
 
-        $authors = array();
-        $postauthors = get_coauthors();
-        foreach($postauthors as $author) {
-            $authors[] = '"'.$author->user_login.'"';
-        }
-
-        $status = get_post_status();
-        $is_draft = $status != 'publish';
-
-        ob_start();
-
-?>---
-layout: "post"
-title: "<?php the_title(); ?>"
-slug: "<?php echo get_post_field('post_name'); ?>"
-date: "<?php the_date('Y-m-d'); ?>" 
-categories: [<?php echo implode(',',$categories); ?>]
-tags: [<?php echo implode(',',$tags); ?>]
-authors: [<?php echo implode(',',$authors); ?>]
-draft: <?php echo $is_draft ? 'true' : 'false'; ?> 
-status: "<?php echo $status; ?>"
----
-<?php
-
-        $content = apply_filters('the_content',get_the_content());
-        $content = str_replace('{{','{{ \'{{\' }}',$content);
-        $content = preg_replace("/<span id=\"more-\d+\">(.*)<\/span>/","\n<p>--more $1--</p>\n",$content);
-        echo $content;
-
-        $contents = ob_get_clean();
-        $contents = $this->fix_upload_url($contents);
-        $filename = $this->post_filename(get_the_ID());
-        file_put_contents($destination.'/'.$filename,$contents);
-
-        $this->built += 1;
+    }
+    public function write_categories_dict() {
+        file_put_contents($this->output_dir . "/categories.json", json_encode($this->category_dict, JSON_PRETTY_PRINT));
     }
 
-    public function make_authors_dict() {
+    public function write_authors_dict() {
         $users = get_users();
         $user_dict = array();
         foreach($users as $user) {
@@ -274,21 +267,157 @@ status: "<?php echo $status; ?>"
 
     }
 
-    protected function post_filename($id) {
-        $date = get_the_date('Y-m-d');
-        return "$date-post-" . $id . CONTENT_FILENAME;
-    }
-
-    protected function fix_upload_url($str) {
+    public function fix_upload_url($str) {
         $uploads_url = home_url('/wp-content/uploads');
         return str_replace($uploads_url, $this->static_uploads_root, $str);
     }
+}
 
-    public function delete_post($postid) {
-        $filename = $this->output_dir . POSTS_DIR . '/' . $this->post_filename($postid);
-        file_put_contents('/tmp/poo',$filename);
-        if(file_exists($filename)) {
-            unlink($filename);
+class StaticizePost {
+    protected $staticize;
+    protected $id;
+    protected $post;
+    protected $title;
+    protected $slug;
+    protected $publish_date;
+    protected $type;
+    protected $destination;
+    protected $tags;
+    protected $realcategories;
+    protected $categories;
+    protected $authors;
+    protected $status;
+
+    protected function is_draft() {
+        return $this->status != 'publish';
+    }
+
+    protected $content;
+    protected $filename;
+
+    function __construct($staticize,$id,$post=NULL) {
+        $this->staticize = $staticize;
+        $this->id = $id;
+        $this->post = $post or get_post($id);
+
+        $this->title = get_the_title($this->post);
+        $this->slug = get_post_field('post_name',$this->post);
+        $this->publish_date = get_the_date('Y-m-d',$this->post);
+        $this->type = get_post_type($this->post);
+        $post_dir = POST_DIRS[$this->type];
+        $this->destination = $this->staticize->output_dir . $post_dir;
+
+        $this->tags = array();
+        $posttags = get_the_tags($this->post);
+        if($posttags) {
+            foreach($posttags as $tag) {
+                $this->tags[] = $tag->name;
+            }
+        }
+        $this->realcategories = array();
+        $postcategories = get_the_category($this->post);
+        if($postcategories) {
+            foreach($postcategories as $category) {
+                $this->realcategories[] = $category->slug;
+            }
+        }
+        $this->categories = array();
+        foreach($this->realcategories as $slug) {
+            $c = $this->staticize->category_dict[$slug];
+            $this->categories[] = $slug;
+            while($c['parent']) {
+                $c = $this->staticize->category_dict[$c['parent']];
+                $this->categories[] = $c['slug'];
+            }
+        }
+        $this->categories = array_unique($this->categories);
+
+        $this->authors = array();
+        $postauthors = get_coauthors($this->post);
+        foreach($postauthors as $author) {
+            $this->authors[] = $author->user_login;
+        }
+
+        $this->status = get_post_status($this->post);
+
+
+        switch($this->type) {
+        case 'post':
+            $this->filename = "$this->publish_date-post-$this->id" . CONTENT_FILENAME;
+            break;
+        case 'page':
+            $this->filename = $this->slug . CONTENT_FILENAME;
+            break;
+        }
+    }
+
+    public function content() {
+        $GLOBALS['more'] = true;
+        $GLOBALS['post'] = $this->post;
+        setup_postdata($this->post);
+        $content = apply_filters('the_content',get_the_content());
+        $content = str_replace('{{','{{ \'{{\' }}',$content);
+        $content = preg_replace("/<span id=\"more-\d*\">(.*)<\/span>/","\n<p>--more $1--</p>\n",$content);
+        return $content;
+    }
+
+    public function render() {
+        $GLOBALS['more'] = true;
+        $GLOBALS['post'] = $this->post;
+        setup_postdata($this->post);
+
+        echo "<li>$this->title</li>";
+
+        if(!file_exists($this->destination)) {
+            mkdir($destination,0700,true);
+        }
+
+        ob_start();
+
+        $this->frontmatter();
+
+        echo $this->content();
+
+        $contents = ob_get_clean();
+        $contents = $this->staticize->fix_upload_url($contents);
+        file_put_contents("$this->destination/$this->filename",$contents);
+    }
+
+
+    protected function frontmatter() {
+        switch($this->type) {
+        case 'post':
+?>---
+layout: "post"
+title: "<?= $this->title; ?>"
+slug: "<?= $this->slug; ?>"
+date: "<?= $this->publish_date; ?>" 
+categories: <?= json_encode($this->categories); ?> 
+real_categories: <?= json_encode($this->realcategories); ?> 
+tags: <?= json_encode($this->tags); ?> 
+authors: <?= json_encode($this->authors); ?> 
+draft: <?= $this->is_draft() ? 'true' : 'false'; ?>  
+status: "<?= $this->status; ?>"
+---
+<?php
+            break;
+        case 'page':
+?>---
+layout: "page"
+title: "<?= $this->title; ?>"
+slug: "<?= $this->slug; ?>"
+authors: <?= json_encode($this->authors); ?> 
+draft: <?= $this->is_draft() ? 'true' : 'false'; ?> 
+status: "<?= $this->status; ?>"
+---
+<?php
+            break;
+        }
+    }
+
+    public function delete_post() {
+        if(file_exists($this->filename)) {
+            unlink($this->filename);
         }
     }
 
