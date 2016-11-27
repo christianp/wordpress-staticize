@@ -42,7 +42,7 @@ function copy_dir($source,$dest) {
             }
         } else {
             $item_dest = $dest . DIRECTORY_SEPARATOR . $iterator->getSubPathName();
-            if(filemtime($item)>filemtime($item_dest)) {
+            if(!file_exists($item_dest) || filemtime($item)>filemtime($item_dest)) {
                 copy($item, $item_dest);
             }
         }
@@ -78,7 +78,7 @@ class Staticize {
         $settings = get_option('staticize_options');
         $this->spress_site_dir = $settings['staticize_spress_site_dir'];
         $this->output_dir = $settings['staticize_output_dir'];
-        $this->static_home_url = $settings['static_home_url'];
+        $this->static_home_url = $settings['staticize_static_home_url'];
         $this->static_uploads_root = $this->static_home_url . '/uploads';
         $this->last_build_time = $this->get_option('last_build');
         $this->make_categories_dict();
@@ -179,6 +179,10 @@ class Staticize {
             $this->render_all(true);
             $this->write_authors_dict();
             $this->run_spress();
+?>
+<h2>Done!</h2>
+<p>See the static site at <a target="_blank" href="<?= $this->static_home_url ?>"><?= $this->static_home_url ?></a></p>
+<?php
         }
     }
 
@@ -310,6 +314,7 @@ class Staticize {
     }
 
     function run_spress() {
+        echo "<h2>Running Spress</h2>";
         chdir($this->spress_site_dir);
         $descriptorspec = array(
            0 => array("pipe", "r"),
@@ -320,17 +325,23 @@ class Staticize {
             "HOME" => "/home/christian"
         ];
         $spress_bin = 'php spress.phar';
-        $process = proc_open("$spress_bin site:build -s $this->spress_site_dir",$descriptorspec,$pipes,__DIR__,$env);
+        $process = proc_open("$spress_bin site:build --env=prod -s $this->spress_site_dir",$descriptorspec,$pipes,__DIR__,$env);
         if(is_resource($process)) {
             fclose($pipes[0]);
-            echo "STDOUT <pre>".stream_get_contents($pipes[1])."</pre>";
+            echo "<pre>".stream_get_contents($pipes[1])."</pre>";
             fclose($pipes[1]);
-            echo "STDERR <pre>".stream_get_contents($pipes[2])."</pre>";
+            $stderr = stream_get_contents($pipes[2]);
+            if($stderr) {
+                echo "STDERR <pre>".$stderr."</pre>";
+            }
             fclose($pipes[2]);
             $return_value = proc_close($process);
         }
 
         copy_dir($this->spress_site_dir . '/build',$this->output_dir);
+        $upload_path = wp_upload_dir()['basedir'];
+        echo "<h2>Copying uploads</h2>";
+        copy_dir($upload_path,$this->output_dir.'/uploads');
     }
 
     public function fix_upload_url($str) {
