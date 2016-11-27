@@ -26,10 +26,34 @@ function get_relative_permalink( $url ) {
     return str_replace( home_url(), "", $url );
 }
 
+function copy_dir($source,$dest) {
+    if(!file_exists($dest)) {
+        mkdir($dest, 0755);
+    }
+    foreach (
+        $iterator = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($source, \RecursiveDirectoryIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::SELF_FIRST) as $item
+    ) {
+        if ($item->isDir()) {
+            $dir = $dest . DIRECTORY_SEPARATOR . $iterator->getSubPathName();
+            if(!file_exists($dir)) {
+                mkdir($dir);
+            }
+        } else {
+            $item_dest = $dest . DIRECTORY_SEPARATOR . $iterator->getSubPathName();
+            if(filemtime($item)>filemtime($item_dest)) {
+                copy($item, $item_dest);
+            }
+        }
+    }
+}
+
 class Staticize {
 
     protected static $instance = NULL;
 
+    public $spress_site_dir = '';
     public $output_dir = '';
     protected $static_home_url = '';
     protected $static_uploads_root = '';
@@ -52,6 +76,7 @@ class Staticize {
 
     public function setup() {
         $settings = get_option('staticize_options');
+        $this->spress_site_dir = $settings['staticize_spress_site_dir'];
         $this->output_dir = $settings['staticize_output_dir'];
         $this->static_home_url = $settings['static_home_url'];
         $this->static_uploads_root = $this->static_home_url . '/uploads';
@@ -67,13 +92,13 @@ class Staticize {
                 register_setting('staticize','staticize_options');
                 add_settings_section('staticize_settings','Staticize plugin settings',array(&$this,'settings_callback'),'staticize');
                 add_settings_field(
-                    'staticize_output_dir',
-                    'Output directory',
+                    'staticize_spress_site_dir',
+                    'Spress site directory',
                     array(&$this,'setting_text_field_cb'),
                     'staticize',
                     'staticize_settings',
                     [
-                        'label_for' => 'staticize_output_dir',
+                        'label_for' => 'staticize_spress_site_dir',
                         'class' => 'staticize_row'
                     ]
                 );
@@ -88,18 +113,34 @@ class Staticize {
                         'class' => 'staticize_row'
                     ]
                 );
+                add_settings_field(
+                    'staticize_output_dir',
+                    'Path to output directory',
+                    array(&$this,'setting_text_field_cb'),
+                    'staticize',
+                    'staticize_settings',
+                    [
+                        'label_for' => 'staticize_output_dir',
+                        'class' => 'staticize_row'
+                    ]
+                );
             });
         }
 
         add_action('post_updated',function($post_id,$post_after,$post_before) {
             $post = new StaticizePost($this,$post_id,get_post($post_id));
             $post->render();
+            $this->run_spress();
         });
-        add_action('profile_update',array(&$this,'write_authors_dict'));
+        add_action('profile_update',function() {
+            $this->write_authors_dict();
+            $this->run_spress();
+        });
 
         add_action('trash_post',function($postid) {
             $post = new StaticizePost($this,$postid);
             $post->delete_post();
+            $this->run_spress();
         });
     }
 
@@ -137,6 +178,7 @@ class Staticize {
             $this->write_categories_dict();
             $this->render_all(true);
             $this->write_authors_dict();
+            $this->run_spress();
         }
     }
 
@@ -245,7 +287,7 @@ class Staticize {
 
     }
     public function write_categories_dict() {
-        file_put_contents($this->output_dir . "/categories.json", json_encode($this->category_dict, JSON_PRETTY_PRINT));
+        file_put_contents($this->spress_site_dir . "/src/data/categories.json", json_encode($this->category_dict, JSON_PRETTY_PRINT));
     }
 
     public function write_authors_dict() {
@@ -263,8 +305,32 @@ class Staticize {
             );
         }
 
-        file_put_contents($this->output_dir . "/authors.json", json_encode($user_dict, JSON_PRETTY_PRINT));
+        file_put_contents($this->spress_site_dir . "/src/data/authors.json", json_encode($user_dict, JSON_PRETTY_PRINT));
 
+    }
+
+    function run_spress() {
+        chdir($this->spress_site_dir);
+        $descriptorspec = array(
+           0 => array("pipe", "r"),
+           1 => array("pipe", "w"),
+           2 => array("pipe", "w")
+        );
+        $env = [
+            "HOME" => "/home/christian"
+        ];
+        $spress_bin = 'php spress.phar';
+        $process = proc_open("$spress_bin site:build -s $this->spress_site_dir",$descriptorspec,$pipes,__DIR__,$env);
+        if(is_resource($process)) {
+            fclose($pipes[0]);
+            echo "STDOUT <pre>".stream_get_contents($pipes[1])."</pre>";
+            fclose($pipes[1]);
+            echo "STDERR <pre>".stream_get_contents($pipes[2])."</pre>";
+            fclose($pipes[2]);
+            $return_value = proc_close($process);
+        }
+
+        copy_dir($this->spress_site_dir . '/build',$this->output_dir);
     }
 
     public function fix_upload_url($str) {
@@ -305,7 +371,7 @@ class StaticizePost {
         $this->publish_date = get_the_date('Y-m-d',$this->post);
         $this->type = get_post_type($this->post);
         $post_dir = POST_DIRS[$this->type];
-        $this->destination = $this->staticize->output_dir . $post_dir;
+        $this->destination = $this->staticize->spress_site_dir . $post_dir;
 
         $this->tags = array();
         $posttags = get_the_tags($this->post);
@@ -366,7 +432,7 @@ class StaticizePost {
         $GLOBALS['post'] = $this->post;
         setup_postdata($this->post);
 
-        echo "<li>$this->title</li>";
+        //echo "<li>$this->title</li>";
 
         if(!file_exists($this->destination)) {
             mkdir($destination,0700,true);
