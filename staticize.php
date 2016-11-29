@@ -16,10 +16,10 @@ namespace staticize;
 
 defined( 'ABSPATH' ) or die( 'No script kiddies please!' );
 
-define('POST_DIRS',[
+$post_dirs =[
     'post' => '/src/content/posts',
     'page' => '/src/content'
-]);
+];
 define('CONTENT_FILENAME','.html');
 
 function get_relative_permalink( $url ) {
@@ -57,6 +57,7 @@ class Staticize {
     public $output_dir = '';
     protected $static_home_url = '';
     protected $static_uploads_root = '';
+	protected $php_bin = 'php';
 
     protected $last_build_time = '';
 
@@ -80,6 +81,7 @@ class Staticize {
         $this->output_dir = $settings['staticize_output_dir'];
         $this->static_home_url = $settings['staticize_static_home_url'];
         $this->static_uploads_root = $this->static_home_url . '/uploads';
+        $this->php_bin = $settings['staticize_php_bin'];
         $this->last_build_time = $this->get_option('last_build');
         $this->make_categories_dict();
 
@@ -124,23 +126,40 @@ class Staticize {
                         'class' => 'staticize_row'
                     ]
                 );
+                add_settings_field(
+                    'staticize_php_bin',
+                    'Name of the PHP executable to use',
+                    array(&$this,'setting_text_field_cb'),
+                    'staticize',
+                    'staticize_settings',
+                    [
+                        'label_for' => 'staticize_php_bin',
+                        'class' => 'staticize_row'
+                    ]
+                );
             });
         }
 
-        add_action('post_updated',function($post_id,$post_after,$post_before) {
+        add_action('post_updated',function($post_id) {
+			ob_start();
             $post = new StaticizePost($this,$post_id,get_post($post_id));
             $post->render();
-            $this->run_spress();
+			$this->run_spress();
+			ob_end_clean();
         });
         add_action('profile_update',function() {
+			ob_start();
             $this->write_authors_dict();
             $this->run_spress();
+			ob_end_clean();
         });
 
         add_action('trash_post',function($postid) {
+			ob_start();
             $post = new StaticizePost($this,$postid);
             $post->delete_post();
             $this->run_spress();
+			ob_end_clean();
         });
     }
 
@@ -232,7 +251,7 @@ class Staticize {
         ?></ul><?php
 
         echo "<p>$this->built pages built.</p>";
-        $posts = new \WP_Query('orderby=modified&nopaging=true');
+        $posts = new \WP_Query(['orderby' => 'modified','nopaging' => true, 'post_type' => 'post']);
 
         ?>
             <h2>Rebuilding posts</h2>
@@ -246,6 +265,7 @@ class Staticize {
             $modified_date = get_the_modified_date('U');
             if($force_rebuild || $modified_date > $this->last_build_time) {
                 $post = new StaticizePost($this,$GLOBALS['post']->ID);
+				echo "<li>$post->name</li>";
                 $post->render();
                 $this->built += 1;
             }
@@ -304,9 +324,11 @@ class Staticize {
                 'display_name' => $user->display_name,
                 'id' => $user->id,
                 'url' => $user->user_url,
-                'bio' => $user->get('description'),
-                'avatar' => $this->fix_upload_url(get_wp_user_avatar_src($user->id))
+                'bio' => $user->get('description')
             );
+			if(function_exists('get_wp_user_avatar_src')) {
+				$user_dict[$user->user_login]['avatar'] = $this->fix_upload_url(get_wp_user_avatar_src($user->id));
+			}
         }
 
         file_put_contents($this->spress_site_dir . "/src/data/authors.json", json_encode($user_dict, JSON_PRETTY_PRINT));
@@ -322,10 +344,9 @@ class Staticize {
            2 => array("pipe", "w")
         );
         $env = [
-            "HOME" => "/home/christian"
+            "HOME" => '/home'
         ];
-        $spress_bin = 'php spress.phar';
-        $process = proc_open("$spress_bin site:build --env=prod -s $this->spress_site_dir",$descriptorspec,$pipes,__DIR__,$env);
+        $process = proc_open("$this->php_bin spress.phar site:build --env=prod -s $this->spress_site_dir",$descriptorspec,$pipes,__DIR__,$env);
         if(is_resource($process)) {
             fclose($pipes[0]);
             echo "<pre>".stream_get_contents($pipes[1])."</pre>";
@@ -364,6 +385,8 @@ class StaticizePost {
     protected $categories;
     protected $authors;
     protected $status;
+	protected $comments;
+	protected $pings;
 
     protected function is_draft() {
         return $this->status != 'publish';
@@ -373,6 +396,7 @@ class StaticizePost {
     protected $filename;
 
     function __construct($staticize,$id,$post=NULL) {
+		global $post_dirs;
         $this->staticize = $staticize;
         $this->id = $id;
         $this->post = $post or get_post($id);
@@ -381,7 +405,7 @@ class StaticizePost {
         $this->slug = get_post_field('post_name',$this->post);
         $this->publish_date = get_the_date('Y-m-d',$this->post);
         $this->type = get_post_type($this->post);
-        $post_dir = POST_DIRS[$this->type];
+        $post_dir = $post_dirs[$this->type];
         $this->destination = $this->staticize->spress_site_dir . $post_dir;
 
         $this->tags = array();
@@ -410,7 +434,11 @@ class StaticizePost {
         $this->categories = array_unique($this->categories);
 
         $this->authors = array();
-        $postauthors = get_coauthors($this->post);
+		if(function_exists('get_coauthors')) {
+			$postauthors = get_coauthors($this->post);
+		} else {
+			$postauthors = [get_the_author_meta('user_login')];
+		}
         foreach($postauthors as $author) {
             $this->authors[] = $author->user_login;
         }
@@ -426,6 +454,21 @@ class StaticizePost {
             $this->filename = $this->slug . CONTENT_FILENAME;
             break;
         }
+
+		$this->comments = get_comments([
+			'post_id'=>$this->id,
+			'type'=>'comment',
+			'orderby'=>'comment_date_gmt',
+			'order'=>'ASC',
+			'status' => 'approve'
+		]);
+		$this->pings = get_comments([
+			'post_id'=>$this->id,
+			'type'=>'pings',
+			'orderby'=>'comment_date_gmt',
+			'order'=>'ASC',
+			'status' => 'approve'
+		]);
     }
 
     public function content() {
@@ -446,6 +489,7 @@ class StaticizePost {
         //echo "<li>$this->title</li>";
 
         if(!file_exists($this->destination)) {
+			echo $this->destination;
             mkdir($destination,0700,true);
         }
 
@@ -475,6 +519,10 @@ tags: <?= json_encode($this->tags); ?>
 authors: <?= json_encode($this->authors); ?> 
 draft: <?= $this->is_draft() ? 'true' : 'false'; ?>  
 status: "<?= $this->status; ?>"
+comments: 
+<?php foreach($this->comments as $comment) { $this->render_comment($comment); }?>
+pings: 
+<?php foreach($this->pings as $comment) { $this->render_comment($comment); }?>
 ---
 <?php
             break;
@@ -491,6 +539,19 @@ status: "<?= $this->status; ?>"
             break;
         }
     }
+
+	protected function render_comment($comment) {
+?>
+-
+  author: "<?= $comment->comment_author ?>"
+  id: <?= $comment->comment_ID ?> 
+  author_email: "<?= $comment->comment_author_email ?>"
+  author_url: "<?= $comment->comment_author_url ?>"
+  date: "<?= $comment->comment_date ?>"
+  content: <?= json_encode(apply_filters('comment_text',get_comment_text($comment),$comment)); ?> 
+  type: "<?= $comment->comment_type ?>"
+<?php
+	}
 
     public function delete_post() {
         if(file_exists($this->filename)) {
